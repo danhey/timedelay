@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from astropy.stats import LombScargle
+from tqdm import tqdm
 
 class TimeDelay():
 
@@ -50,28 +51,51 @@ class TimeDelay():
         uHz_conv = 1e-6 * 24 * 60 * 60  # Factor to convert between day^-1 and uHz
         times, mags = self.times, self.mags
 
+        time_0 = times[0]
+        time_slice, mag_slice, mid_time, phase = [], [], [], []
         self.time_delays, self.time_midpoints = [], []
 
-        for freq in self.nu:
-            times_0 = times[0]
-            phase, time_mid = [], []
-
-            mod, time_mod = [], []
-            for i, j in zip(times, mags):
-                mod.append(j)
-                time_mod.append(i)
-
-                if i-times_0 > segment_size:
-                    phase.append(self.ft_single(time_mod, mod, freq))
-                    time_mid.append(np.mean(time_mod))
-                    times_0 = i
-                    mod, time_mod = [], []
-
-            phase -= np.mean(phase)
-            tau = phase / (2*np.pi*(freq / uHz_conv * 1e-6))
-            self.time_delays.append(tau)
-            self.time_midpoints.append(time_mid)
+        # Loop over lightcurve
+        for t, y  in tqdm(zip(times, mags), total=len(times)):
+            time_slice.append(t)
+            mag_slice.append(y)
+            
+            # In each segment
+            if t - time_0 > segment_size:
+                # Append the time midpoint
+                self.time_midpoints.append(np.mean(time_slice))
+                
+                # And the phases for each frequency
+                phase.append(self.dft_phase(time_slice, mag_slice, self.nu))
+                time_0 = t
+                time_slice, mag_slice = [], []
+                
+        phase = np.array(phase).T
+        for ph, f in zip(phase, self.nu):
+            # Phase wrapping patch
+            mean_phase = np.mean(ph)
+            ph[np.where(ph - mean_phase > np.pi/2)] -= np.pi
+            ph[np.where(ph - mean_phase < -np.pi/2)] += np.pi
+            
+            ph -= np.mean(ph)
+            td = ph / (2*np.pi*(f / uHz_conv * 1e-6))
+            self.time_delays.append(td)
         return self.time_midpoints, self.time_delays
+
+    def dft_phase(self, x, y, freq, verbose=False):
+        freq = np.asarray(freq)
+        if freq.ndim == 0:
+            freq = freq[None]
+        
+        x = np.array(x)
+        y = np.array(y)
+        phase = []
+        for f in freq:
+            expo = 2.0 * np.pi * f * x
+            ft_real = np.sum(y * np.cos(expo))
+            ft_imag = np.sum(y * np.sin(expo))
+            phase.append(np.arctan(ft_imag/ft_real))
+        return phase
 
     def plot_td(self, periodogram=True, **kwargs):
 
@@ -89,9 +113,8 @@ class TimeDelay():
         else:
             fig, ax = plt.subplots(figsize=[10,5])
             ax = [ax]
-
-        for midpoint, delay, color in zip(time_midpoints, time_delays, colors):
-            ax[0].scatter(midpoint,delay, alpha=1, s=8,c=color)
+        for delay, color in zip(time_delays, colors):
+            ax[0].scatter(time_midpoints,delay, alpha=1, s=8,c=color)
             ax[0].set_xlabel('Time [BJD]')
             ax[0].set_ylabel(r'Time delay $\tau$ [s]')
         return ax
@@ -179,37 +202,68 @@ class TimeDelay():
         amp = np.sqrt(np.abs(power)) * fct
         return freq_uHz * uHz_conv, amp
 
-    def plot_periodogram(self, ax=None):
+    def plot_periodogram(self, ax=None, **kwargs):
         """ Plots the periodogram of the lightcurve """
-        per_freq, per_amp = self.periodogram()
+        per_freq, per_amp = self.periodogram(**kwargs)
         if ax is None:
             fig, ax = plt.subplots()
         ax.plot(per_freq, per_amp, "k", linewidth=0.5)
-        ax.set_xlabel("frequency [cpd]")
+        ax.set_xlabel("Frequency [cpd]")
         ax.set_ylabel("Amplitude [mag]")
+        ax.set_xlim(per_freq[0], per_freq[-1])
+        ax.set_xlabel(r"frequency $[d^{-1}]$")
+        nyquist = 0.5 / np.median(np.diff(self.times))
+        ax.axvline(nyquist, c='r')
+        ax.set_ylabel("Amplitude")
+        ax.set_ylim([0,None])
         return ax
 
-    def ft_single(self, x, y, freq):
-        """ This calculates the discrete fourier transform of the signal 
-        at a specified signal, returning the phase. Should really be vectorized
-        """
-        x = np.asarray(x)
-        y = np.asarray(y)
-        notnans = (~np.isnan(x)) & (~np.isnan(y))
-        x = x[notnans]
-        y = y[notnans]
+    def first_look(self, segment_size=5):
+        fig, ax = plt.subplots(4,1,figsize=[12,12])
 
-        ft_real, ft_imag, power, fr = [], [], [], []
-        len_x = len(x)
-        ft_real.append(0.0)
-        ft_imag.append(0.0)
-        omega = 2.0 * np.pi * freq
-        for i in range(len_x):
-            expo = omega * x[i]
-            c = np.cos(expo)
-            s = np.sin(expo)
-            ft_real[-1] += y[i] * c
-            ft_imag[-1] += y[i] * s
-        phase = np.arctan(ft_imag[0]/ft_real[0])
-        return phase
+        t, y = self.times, self.mags
 
+        # Lightcurve
+        ax[0].plot(t, y, "k", linewidth=0.5)
+        ax[0].set_xlabel('Time [BJD]')
+        ax[0].set_ylabel('Magnitude [mag]')
+        ax[0].set_xlim([t.min(), t.max()])
+        ax[0].invert_yaxis()
+
+        # Periodogram
+        periodogram_freq, periodogram_amp = self.periodogram()
+        ax[1].plot(periodogram_freq, periodogram_amp, "k", linewidth=0.5)
+        ax[1].set_xlabel("Frequency [$d^{-1}$]")
+        ax[1].set_ylabel("Amplitude [mag]")
+        colors = ['red','darkorange','gold','seagreen','dodgerblue','darkorchid','mediumvioletred']
+        for freq, color in zip(self.nu, colors):
+                ax[1].scatter(freq, np.max(periodogram_amp), c=color)
+        ax[1].set_xlim([periodogram_freq[0], periodogram_freq[-1]])
+        ax[1].set_ylim([0,None])
+
+        # Time delays
+        time_midpoints, time_delays = self.time_delay(segment_size)
+        for delay, color in zip(time_delays, colors):
+            ax[2].scatter(time_midpoints,delay, alpha=1, s=8,c=color)
+            ax[2].set_xlabel('Time [BJD]')
+            ax[2].set_ylabel(r'$\tau [s]$')
+        ax[2].set_xlim([t.min(), t.max()])
+
+        # Averaged periodogram
+        t = time_midpoints
+        y = np.average(time_delays, axis=0)
+
+        nyquist = 0.5 / np.median(np.diff(t))
+        freq = np.linspace(1e-2, nyquist, 100000)
+
+        model = LombScargle(t, y)
+        sc = model.power(freq, method="fast", normalization="psd")
+        amp = np.sqrt(np.abs(sc)) * np.sqrt(4./len(t))
+        ax[3].plot(freq, amp, "k", linewidth=0.5)
+        ax[3].set_xlabel("Frequency $[d^{-1}]$")
+        ax[3].set_ylabel(r'Average $\tau$ amplitude')
+        ax[3].set_xlim([freq[0], freq[-1]])
+        ax[3].set_ylim([0,None])
+
+        plt.subplots_adjust(hspace=0.33)
+        plt.show()
